@@ -71,6 +71,7 @@ import org.webrtc.PeerConnection.RtcpMuxPolicy;
 import org.webrtc.PeerConnection.SdpSemantics;
 import org.webrtc.PeerConnection.TcpCandidatePolicy;
 import org.webrtc.PeerConnectionFactory;
+import org.webrtc.NetworkMonitorAutoDetect;
 import org.webrtc.PeerConnectionFactory.InitializationOptions;
 import org.webrtc.PeerConnectionFactory.Options;
 import org.webrtc.RtpCapabilities;
@@ -192,12 +193,15 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       return;
     }
 
+
     PeerConnectionFactory.initialize(
             InitializationOptions.builder(context)
+                    .setFieldTrials("IncludeWifiDirect/Enabled/")
                     .setEnableInternalTracer(true)
                     .setInjectableLogger(logSink, logSeverity)
                     .createInitializationOptions());
 
+    NetworkMonitorAutoDetect.setIncludeWifiDirect(true);
     getUserMediaImpl = new GetUserMediaImpl(this, context);
 
     cameraUtils = new CameraUtils(getUserMediaImpl, activity);
@@ -340,7 +344,6 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     mFactory = factoryBuilder
             .setAudioDeviceModule(audioDeviceModule)
             .createPeerConnectionFactory();
-
   }
 
   @Override
