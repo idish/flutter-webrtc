@@ -11,6 +11,7 @@
 #import "FlutterRTCFrameCryptor.h"
 #if TARGET_OS_IPHONE
 #import "FlutterRTCMediaRecorder.h"
+#import "../../../ios/Classes/FlutterRTCPipController.h"
 #import "FlutterRTCVideoPlatformViewFactory.h"
 #import "FlutterRTCVideoPlatformViewController.h"
 #endif
@@ -118,6 +119,7 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
   AVAudioSessionPort _preferredInput;
   AudioManager* _audioManager;
 #if TARGET_OS_IPHONE
+  FlutterRTCPipController *_pipController API_AVAILABLE(ios(15.0));
   FLutterRTCVideoPlatformViewFactory *_platformViewFactory;
 #endif
 
@@ -219,6 +221,14 @@ static FlutterWebRTCPlugin *sharedSingleton;
 }
 
 - (void)detachFromEngineForRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
+#if TARGET_OS_IPHONE
+  if (@available(iOS 15.0, *)) {
+    if (_pipController) {
+      [_pipController stop];
+      _pipController = nil;
+    }
+  }
+#endif
   for (RTCPeerConnection* peerConnection in _peerConnections.allValues) {
     for (RTCDataChannel* dataChannel in peerConnection.dataChannels) {
       dataChannel.eventSink = nil;
@@ -532,6 +542,52 @@ static FlutterWebRTCPlugin *sharedSingleton;
                                    details:nil]);
       }
     }
+#if TARGET_OS_IPHONE
+  } else if ([@"pipIsSupported" isEqualToString:call.method]) {
+    if (@available(iOS 15.0, *)) {
+      result(@([FlutterRTCPipController isPictureInPictureSupported]));
+    } else {
+      result(@(NO));
+    }
+  } else if ([@"pipStart" isEqualToString:call.method]) {
+    NSDictionary* argsMap = call.arguments;
+    NSString* trackId = argsMap[@"trackId"];
+    NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+    RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
+    if (@available(iOS 15.0, *)) {
+      if (track != nil && [track isKindOfClass:[RTCVideoTrack class]]) {
+        RTCVideoTrack* videoTrack = (RTCVideoTrack*)track;
+        if (_pipController) {
+          [_pipController stop];
+          _pipController = nil;
+        }
+        _pipController = [[FlutterRTCPipController alloc] initWithVideoTrack:videoTrack];
+        BOOL started = [_pipController start];
+        result(@(started));
+      } else {
+        result(@(NO));
+      }
+    } else {
+      result(@(NO));
+    }
+  } else if ([@"pipStop" isEqualToString:call.method]) {
+    if (@available(iOS 15.0, *)) {
+      if (_pipController) {
+        [_pipController stop];
+        _pipController = nil;
+      }
+      result(@(YES));
+    } else {
+      result(@(NO));
+    }
+  } else if ([@"pipIsActive" isEqualToString:call.method]) {
+    if (@available(iOS 15.0, *)) {
+      BOOL isActive = _pipController ? [_pipController isActive] : NO;
+      result(@(isActive));
+    } else {
+      result(@(NO));
+    }
+#endif
   } else if ([@"setLocalDescription" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSString* peerConnectionId = argsMap[@"peerConnectionId"];
