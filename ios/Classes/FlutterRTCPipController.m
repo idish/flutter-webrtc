@@ -120,9 +120,15 @@
   UIView *hostView = [self hostView];
   if (hostView) {
     _pipView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
-    _pipView.hidden = YES;
+    _pipView.backgroundColor = [UIColor clearColor];
+    _pipView.userInteractionEnabled = NO;
+    _pipView.accessibilityElementsHidden = YES;
+    _pipView.isAccessibilityElement = NO;
+    _pipView.alpha = 0.01;
     [hostView addSubview:_pipView];
     [_pipView.layer addSublayer:_displayLayer];
+  } else {
+    NSLog(@"FlutterRTCPipController: hostView is nil; PiP view not attached");
   }
 }
 
@@ -150,6 +156,40 @@
         break;
       }
     }
+  }
+  if (!keyWindow) {
+    if (@available(iOS 13.0, *)) {
+      for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) {
+          continue;
+        }
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+          continue;
+        }
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        for (UIWindow *window in windowScene.windows) {
+          if (window.isKeyWindow) {
+            keyWindow = window;
+            break;
+          }
+        }
+        if (keyWindow) {
+          break;
+        }
+      }
+    }
+  }
+  if (!keyWindow) {
+    id<UIApplicationDelegate> appDelegate = UIApplication.sharedApplication.delegate;
+    if ([appDelegate respondsToSelector:@selector(window)]) {
+      keyWindow = appDelegate.window;
+    }
+  }
+  if (!keyWindow) {
+    keyWindow = UIApplication.sharedApplication.windows.firstObject;
+  }
+  if (!keyWindow || !keyWindow.rootViewController) {
+    return nil;
   }
   return keyWindow.rootViewController.view;
 }
@@ -347,6 +387,11 @@
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
             didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+    failedToStartPictureInPictureWithError:(NSError *)error {
+  NSLog(@"FlutterRTCPipController: failed to start PiP: %@", error);
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
