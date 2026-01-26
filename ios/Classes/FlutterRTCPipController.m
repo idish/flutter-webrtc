@@ -15,6 +15,8 @@
   CMTimebaseRef _timebase;
   CGSize _lastFrameSize;
   BOOL _isPlaying;
+  BOOL _hasRenderedFrame;
+  BOOL _pendingStart;
   BOOL _isRendererAttached;
   dispatch_queue_t _frameQueue;
 }
@@ -48,7 +50,13 @@
     }
 
     if (!_pipController.isPictureInPictureActive) {
-      [_pipController startPictureInPicture];
+      if (_hasRenderedFrame) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self->_pipController startPictureInPicture];
+        });
+      } else {
+        _pendingStart = YES;
+      }
     }
     return YES;
   }
@@ -91,6 +99,8 @@
       [_pipController stopPictureInPicture];
     }
     _pipController = nil;
+    _pendingStart = NO;
+    _hasRenderedFrame = NO;
 
     if (_displayLayer) {
       [_displayLayer flushAndRemoveImage];
@@ -123,7 +133,7 @@
   _displayLayer = [AVSampleBufferDisplayLayer new];
   _displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
   _displayLayer.backgroundColor = [UIColor blackColor].CGColor;
-  _displayLayer.frame = CGRectMake(0, 0, 1, 1);
+  _displayLayer.frame = CGRectMake(0, 0, 160, 90);
 
   CMTimebaseRef timebase = NULL;
   if (CMTimebaseCreateWithMasterClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &timebase) == noErr) {
@@ -135,7 +145,7 @@
 
   UIView *hostView = [self hostView];
   if (hostView) {
-    _pipView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+    _pipView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 160, 90)];
     _pipView.backgroundColor = [UIColor clearColor];
     _pipView.userInteractionEnabled = NO;
     _pipView.accessibilityElementsHidden = YES;
@@ -241,6 +251,16 @@
       }
       if (strongSelf->_displayLayer.isReadyForMoreMediaData) {
         [strongSelf->_displayLayer enqueueSampleBuffer:sampleBuffer];
+      }
+      if (!strongSelf->_hasRenderedFrame) {
+        strongSelf->_hasRenderedFrame = YES;
+        if (strongSelf->_pendingStart && strongSelf->_pipController &&
+            !strongSelf->_pipController.isPictureInPictureActive) {
+          strongSelf->_pendingStart = NO;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            [strongSelf->_pipController startPictureInPicture];
+          });
+        }
       }
       CFRelease(sampleBuffer);
     }
