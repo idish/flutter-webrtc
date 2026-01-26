@@ -553,6 +553,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSDictionary* argsMap = call.arguments;
     NSString* trackId = argsMap[@"trackId"];
     NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+    BOOL mirror = [argsMap[@"mirror"] boolValue];
     RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
     if (@available(iOS 15.0, *)) {
       if (track != nil && [track isKindOfClass:[RTCVideoTrack class]]) {
@@ -562,8 +563,43 @@ static FlutterWebRTCPlugin *sharedSingleton;
           _pipController = nil;
         }
         _pipController = [[FlutterRTCPipController alloc] initWithVideoTrack:videoTrack];
+        _pipController.mirror = mirror;
         BOOL started = [_pipController start];
         result(@(started));
+      } else {
+        result(@(NO));
+      }
+    }
+  } else if ([@"pipPrepare" isEqualToString:call.method]) {
+    NSDictionary* argsMap = call.arguments;
+    NSString* trackId = argsMap[@"trackId"];
+    NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+    BOOL mirror = [argsMap[@"mirror"] boolValue];
+    RTCMediaStreamTrack* track = [self trackForId:trackId peerConnectionId:peerConnectionId];
+    if (@available(iOS 15.0, *)) {
+      if (track != nil && [track isKindOfClass:[RTCVideoTrack class]]) {
+        RTCVideoTrack* videoTrack = (RTCVideoTrack*)track;
+        if (_pipController) {
+          [_pipController stop];
+          _pipController = nil;
+        }
+        _pipController = [[FlutterRTCPipController alloc] initWithVideoTrack:videoTrack];
+        _pipController.mirror = mirror;
+        BOOL prepared = [_pipController prepare];
+        result(@(prepared));
+      } else {
+        result(@(NO));
+      }
+    } else {
+      result(@(NO));
+    }
+  } else if ([@"pipSetMirror" isEqualToString:call.method]) {
+    NSDictionary* argsMap = call.arguments;
+    BOOL mirror = [argsMap[@"mirror"] boolValue];
+    if (@available(iOS 15.0, *)) {
+      if (_pipController) {
+        _pipController.mirror = mirror;
+        result(@(YES));
       } else {
         result(@(NO));
       }

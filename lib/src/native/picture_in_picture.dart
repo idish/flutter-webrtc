@@ -12,7 +12,10 @@ class WebRTCPictureInPicture {
     return result == true;
   }
 
-  static Future<bool> start(MediaStreamTrack track) async {
+  static Future<bool> start(
+    MediaStreamTrack track, {
+    bool mirror = false,
+  }) async {
     if (!WebRTC.platformIsIOS) {
       return false;
     }
@@ -21,6 +24,34 @@ class WebRTCPictureInPicture {
     final result = await WebRTC.invokeMethod('pipStart', <String, dynamic>{
       'trackId': track.id,
       'peerConnectionId': peerConnectionId,
+      'mirror': mirror,
+    });
+    return result == true;
+  }
+
+  static Future<bool> prepare(
+    MediaStreamTrack track, {
+    bool mirror = false,
+  }) async {
+    if (!WebRTC.platformIsIOS) {
+      return false;
+    }
+    final peerConnectionId =
+        track is MediaStreamTrackNative ? track.peerConnectionId : null;
+    final result = await WebRTC.invokeMethod('pipPrepare', <String, dynamic>{
+      'trackId': track.id,
+      'peerConnectionId': peerConnectionId,
+      'mirror': mirror,
+    });
+    return result == true;
+  }
+
+  static Future<bool> setMirror(bool mirror) async {
+    if (!WebRTC.platformIsIOS) {
+      return false;
+    }
+    final result = await WebRTC.invokeMethod('pipSetMirror', <String, dynamic>{
+      'mirror': mirror,
     });
     return result == true;
   }
@@ -40,4 +71,5 @@ class WebRTCPictureInPicture {
     final result = await WebRTC.invokeMethod('pipIsActive');
     return result == true;
   }
+
 }

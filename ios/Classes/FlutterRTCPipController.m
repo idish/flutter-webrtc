@@ -15,6 +15,7 @@
   CMTimebaseRef _timebase;
   CGSize _lastFrameSize;
   BOOL _isPlaying;
+  BOOL _isRendererAttached;
   dispatch_queue_t _frameQueue;
 }
 
@@ -42,6 +43,20 @@
 
 - (BOOL)start {
   if (@available(iOS 15.0, *)) {
+    if (![self prepare]) {
+      return NO;
+    }
+
+    if (!_pipController.isPictureInPictureActive) {
+      [_pipController startPictureInPicture];
+    }
+    return YES;
+  }
+  return NO;
+}
+
+- (BOOL)prepare {
+  if (@available(iOS 15.0, *)) {
     if (![FlutterRTCPipController isPictureInPictureSupported]) {
       return NO;
     }
@@ -53,11 +68,9 @@
     if (_pipController == nil) {
       return NO;
     }
-
-    [_videoTrack addRenderer:self];
-
-    if (!_pipController.isPictureInPictureActive) {
-      [_pipController startPictureInPicture];
+    if (!_isRendererAttached) {
+      [_videoTrack addRenderer:self];
+      _isRendererAttached = YES;
     }
     return YES;
   }
@@ -67,7 +80,10 @@
 - (void)stop {
   if (@available(iOS 15.0, *)) {
     if (_videoTrack) {
-      [_videoTrack removeRenderer:self];
+      if (_isRendererAttached) {
+        [_videoTrack removeRenderer:self];
+        _isRendererAttached = NO;
+      }
       _videoTrack = nil;
     }
 
@@ -266,16 +282,26 @@
   return buffer;
 }
 
-- (CVPixelBufferRef)copyPixelBufferFromFrame:(RTCVideoFrame *)frame {
-  id<RTCVideoFrameBuffer> buffer = frame.buffer;
-  if ([buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
-    CVPixelBufferRef pixelBuffer = ((RTCCVPixelBuffer *)buffer).pixelBuffer;
-    if (pixelBuffer) {
-      CVPixelBufferRetain(pixelBuffer);
-      return pixelBuffer;
+static void mirrorBGRA(uint8_t *baseAddress, size_t width, size_t height, size_t bytesPerRow) {
+  const size_t bytesPerPixel = 4;
+  const size_t rowBytes = width * bytesPerPixel;
+  for (size_t y = 0; y < height; y++) {
+    uint8_t *row = baseAddress + (y * bytesPerRow);
+    size_t left = 0;
+    size_t right = rowBytes - bytesPerPixel;
+    while (left < right) {
+      for (size_t i = 0; i < bytesPerPixel; i++) {
+        uint8_t tmp = row[left + i];
+        row[left + i] = row[right + i];
+        row[right + i] = tmp;
+      }
+      left += bytesPerPixel;
+      right -= bytesPerPixel;
     }
   }
+}
 
+- (CVPixelBufferRef)copyPixelBufferFromFrame:(RTCVideoFrame *)frame {
   id<RTCI420Buffer> i420Buffer = [self correctRotation:[frame.buffer toI420]
                                           withRotation:frame.rotation];
   size_t width = (size_t)roundf(i420Buffer.width);
@@ -297,16 +323,21 @@
   uint8_t *dst = CVPixelBufferGetBaseAddress(outputPixelBuffer);
   const size_t bytesPerRow = CVPixelBufferGetBytesPerRow(outputPixelBuffer);
 
-  [RTCYUVHelper I420ToBGRA:i420Buffer.dataY
+  // Match FlutterRTCVideoRenderer: kCVPixelFormatType_32BGRA expects ARGB in libyuv.
+  [RTCYUVHelper I420ToARGB:i420Buffer.dataY
                 srcStrideY:i420Buffer.strideY
                       srcU:i420Buffer.dataU
                 srcStrideU:i420Buffer.strideU
                       srcV:i420Buffer.dataV
                 srcStrideV:i420Buffer.strideV
-                   dstBGRA:dst
-             dstStrideBGRA:(int)bytesPerRow
+                   dstARGB:dst
+             dstStrideARGB:(int)bytesPerRow
                      width:i420Buffer.width
                     height:i420Buffer.height];
+
+  if (_mirror) {
+    mirrorBGRA(dst, width, height, bytesPerRow);
+  }
 
   CVPixelBufferUnlockBaseAddress(outputPixelBuffer, 0);
   return outputPixelBuffer;
