@@ -149,7 +149,7 @@ void FlutterWebRTCBase::ParseConstraints(
       value = GetValue<bool>(v) ? RTCMediaConstraints::kValueTrue
                                 : RTCMediaConstraints::kValueFalse;
     } else {
-      value = std::to_string(GetValue<int>(v));
+      continue;
     }
     if (type == kMandatory) {
       mediaConstraints->AddMandatoryConstraint(key.c_str(), value.c_str());
@@ -367,6 +367,15 @@ FlutterWebRTCBase::GetRtpReceiverById(RTCPeerConnection* pc,
     }
   }
   return result;
+}
+
+libwebrtc::scoped_refptr<libwebrtc::KeyProvider> FlutterWebRTCBase::GetKeyProviderForId(
+      const std::string& keyProviderId) {
+  auto it = key_providers_.find(keyProviderId);
+  if (it != key_providers_.end()) {
+    return it->second;
+  }
+  return nullptr;
 }
 
 }  // namespace flutter_webrtc_plugin

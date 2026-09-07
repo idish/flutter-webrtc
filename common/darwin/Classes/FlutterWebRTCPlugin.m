@@ -11,7 +11,9 @@
 #import "FlutterRTCFrameCryptor.h"
 #if TARGET_OS_IPHONE
 #import "FlutterRTCMediaRecorder.h"
-#import "../../../ios/Classes/FlutterRTCPipController.h"
+#import "FlutterRTCPipController.h"
+#endif
+#if TARGET_OS_IPHONE || TARGET_OS_OSX
 #import "FlutterRTCVideoPlatformViewFactory.h"
 #import "FlutterRTCVideoPlatformViewController.h"
 #endif
@@ -120,7 +122,9 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
   AudioManager* _audioManager;
 #if TARGET_OS_IPHONE
   FlutterRTCPipController *_pipController API_AVAILABLE(ios(15.0));
-  FLutterRTCVideoPlatformViewFactory *_platformViewFactory;
+#endif
+#if TARGET_OS_IPHONE || TARGET_OS_OSX
+  FlutterRTCVideoPlatformViewFactory *_platformViewFactory;
 #endif
 
   RTC_OBJC_TYPE(RTCCallbackLogger) * loggerCallback;
@@ -128,12 +132,59 @@ void postEvent(FlutterEventSink _Nullable sink, id _Nullable event) {
 
 static FlutterWebRTCPlugin *sharedSingleton;
 
+// Process-global so it can be set from native code (e.g. another plugin) before
+// this plugin is even registered. Defaults to enabled. See
+// +setAudioSessionManagementEnabled:.
+static BOOL gAudioSessionManagementEnabled = YES;
+
+// Process-global RTCAudioDeviceModuleDelegate, set by an embedding plugin
+// (e.g. livekit_client) before the factory is created so it can own the audio
+// device module's engine-lifecycle callbacks. Held weakly — the embedder
+// retains it. See +setAudioDeviceModuleObserver:.
+static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
+
 + (FlutterWebRTCPlugin *)sharedSingleton
 {
   @synchronized(self)
   {
     return sharedSingleton;
   }
+}
+
++ (void)setAudioSessionManagementEnabled:(BOOL)enabled {
+  gAudioSessionManagementEnabled = enabled;
+}
+
++ (NSString*)stringForMuteMode:(RTCAudioEngineMuteMode)mode {
+  switch (mode) {
+    case RTCAudioEngineMuteModeVoiceProcessing:
+      return @"voiceProcessing";
+    case RTCAudioEngineMuteModeRestartEngine:
+      return @"restartEngine";
+    case RTCAudioEngineMuteModeInputMixer:
+      return @"inputMixer";
+    case RTCAudioEngineMuteModeUnknown:
+      return @"unknown";
+  }
+}
+
++ (RTCAudioEngineMuteMode)muteModeForString:(NSString*)mode {
+  if ([mode isEqualToString:@"voiceProcessing"]) {
+    return RTCAudioEngineMuteModeVoiceProcessing;
+  } else if ([mode isEqualToString:@"restartEngine"]) {
+    return RTCAudioEngineMuteModeRestartEngine;
+  } else if ([mode isEqualToString:@"inputMixer"]) {
+    return RTCAudioEngineMuteModeInputMixer;
+  }
+  return RTCAudioEngineMuteModeUnknown;
+}
+
++ (void)setAudioDeviceModuleObserver:(id<RTCAudioDeviceModuleDelegate>)observer {
+  gAudioDeviceModuleObserver = observer;
+}
+
+- (BOOL)audioSessionManagementEnabled {
+  return gAudioSessionManagementEnabled;
 }
 
 @synthesize messenger = _messenger;
@@ -187,13 +238,18 @@ static FlutterWebRTCPlugin *sharedSingleton;
 #if TARGET_OS_IPHONE
     _preferredInput = AVAudioSessionPortHeadphones;
     self.viewController = viewController;
-    _platformViewFactory  = [[FLutterRTCVideoPlatformViewFactory alloc] initWithMessenger:messenger];
-    [registrar registerViewFactory:_platformViewFactory withId:FLutterRTCVideoPlatformViewFactoryID];
+#endif
+#if TARGET_OS_IPHONE || TARGET_OS_OSX
+    _platformViewFactory  = [[FlutterRTCVideoPlatformViewFactory alloc] initWithMessenger:messenger];
+    [registrar registerViewFactory:_platformViewFactory withId:FlutterRTCVideoPlatformViewFactoryID];
 #endif
   }
 
   NSDictionary* fieldTrials = @{kRTCFieldTrialUseNWPathMonitor : kRTCFieldTrialEnabledValue};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
   RTCInitFieldTrialDictionary(fieldTrials);
+#pragma clang diagnostic pop
 
   self.peerConnections = [NSMutableDictionary new];
   self.localStreams = [NSMutableDictionary new];
@@ -311,17 +367,36 @@ static FlutterWebRTCPlugin *sharedSingleton;
         VideoEncoderFactorySimulcast* simulcastFactory =
             [[VideoEncoderFactorySimulcast alloc] initWithPrimary:encoderFactory fallback:encoderFactory];
 
-        // macOS Screen Share Audio Crash Fix:
-        // Use CoreAudio ADM (value 0) instead of AVAudioEngine (RTCAudioDeviceModuleTypeAudioEngine)
-        // AVAudioEngine crashes when screen share audio and microphone coexist due to
-        // format conflicts in AVAudioIONodeImpl::SetOutputFormat
-        // See: https://github.com/flutter-webrtc/flutter-webrtc/issues/1986
+        // Use the AVAudioEngine audio device module on iOS devices and macOS.
+        //
+        // macOS previously used the CoreAudio ADM (value 0) to avoid an
+        // AVAudioIONodeImpl::SetOutputFormat sample-rate assertion when the
+        // microphone toggled during screen share (#1986, #1990). That crash
+        // predates the audio engine stability fixes shipped in WebRTC-SDK
+        // 144.7559.04+ (webrtc-sdk/webrtc#228: guarded connect:to:format:,
+        // state-based voice-processing checks, engine recreate ordering).
+        // The AudioEngine ADM enables platform voice processing (Apple
+        // AEC/NS/AGC) and the audio processing options API on macOS.
+        // iOS devices also require the AudioEngine ADM because the CoreAudio ADM
+        // crashes when NSMicrophoneUsageDescription is absent (#2007, #2009).
+        RTCAudioDeviceModuleType audioDeviceModuleType = RTCAudioDeviceModuleTypeAudioEngine;
+#if TARGET_OS_IOS && TARGET_OS_SIMULATOR
+        // The AudioEngine ADM can expose a zero-rate input on the iOS Simulator.
+        audioDeviceModuleType = RTCAudioDeviceModuleTypePlatformDefault;
+#endif
         _peerConnectionFactory =
-            [[RTCPeerConnectionFactory alloc] initWithAudioDeviceModuleType:0
+            [[RTCPeerConnectionFactory alloc] initWithAudioDeviceModuleType:audioDeviceModuleType
                                                       bypassVoiceProcessing:bypassVoiceProcessing
                                                              encoderFactory:simulcastFactory
                                                              decoderFactory:decoderFactory
                                                       audioProcessingModule:_audioManager.audioProcessingModule];
+
+        // Allow an embedding plugin (e.g. livekit_client) to own the audio
+        // device module's engine-lifecycle delegate. Only override the observer
+        // when one is registered, leaving default behavior unchanged otherwise.
+        if (gAudioDeviceModuleObserver != nil) {
+            _peerConnectionFactory.audioDeviceModule.observer = gAudioDeviceModuleObserver;
+        }
 
 #if TARGET_OS_OSX
         // CoreAudio ADM requires explicit device initialization on macOS
@@ -993,7 +1068,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
     [self rendererSetSrcObject:render stream:videoTrack];
     result(nil);
   }
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE || TARGET_OS_OSX
   else if ([@"videoPlatformViewRendererSetSrcObject" isEqualToString:call.method]) {
       NSDictionary* argsMap = call.arguments;
       NSNumber* viewId = argsMap[@"viewId"];
@@ -1212,8 +1287,10 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSNumber* enable = argsMap[@"enable"];
     _speakerOn = enable.boolValue;
     _speakerOnButPreferBluetooth = NO;
-    [AudioUtils setSpeakerphoneOn:_speakerOn];
-    postEvent(self.eventSink, @{@"event" : @"onDeviceChange"});
+    if (self.audioSessionManagementEnabled) {
+      [AudioUtils setSpeakerphoneOn:_speakerOn];
+      postEvent(self.eventSink, @{@"event" : @"onDeviceChange"});
+    }
     result(nil);
   }
   else if ([@"ensureAudioSession" isEqualToString:call.method]) {
@@ -1223,13 +1300,17 @@ static FlutterWebRTCPlugin *sharedSingleton;
   else if ([@"enableSpeakerphoneButPreferBluetooth" isEqualToString:call.method]) {
     _speakerOn = YES;
     _speakerOnButPreferBluetooth = YES;
-    [AudioUtils setSpeakerphoneOnButPreferBluetooth];
+    if (self.audioSessionManagementEnabled) {
+      [AudioUtils setSpeakerphoneOnButPreferBluetooth];
+    }
     result(nil);
   }
   else if([@"setAppleAudioConfiguration" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSDictionary* configuration = argsMap[@"configuration"];
-    [AudioUtils setAppleAudioConfiguration:configuration];
+    if (self.audioSessionManagementEnabled) {
+      [AudioUtils setAppleAudioConfiguration:configuration];
+    }
     result(nil);
   }
 #endif
@@ -1774,7 +1855,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
       });
     } else if ([@"isVoiceProcessingEnabled" isEqualToString:call.method]) {
       RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
-      NSNumber* admResult = [NSNumber numberWithBool:adm.isVoiceProcessingEnabled];
+      NSNumber* admResult = [NSNumber numberWithBool:adm.isPlatformVoiceProcessingAllowed];
       result(admResult);
     } else if ([@"isVoiceProcessingBypassed" isEqualToString:call.method]) {
       RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
@@ -1785,6 +1866,63 @@ static FlutterWebRTCPlugin *sharedSingleton;
       NSNumber* value = call.arguments[@"value"];
       adm.voiceProcessingBypassed = value.boolValue;
       result(nil);
+    } else if ([@"getMicrophoneMuteMode" isEqualToString:call.method]) {
+      RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
+      result([FlutterWebRTCPlugin stringForMuteMode:adm.muteMode]);
+    } else if ([@"setMicrophoneMuteMode" isEqualToString:call.method]) {
+      RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
+      NSString* modeString = call.arguments[@"mode"];
+      RTCAudioEngineMuteMode mode = [FlutterWebRTCPlugin muteModeForString:modeString];
+      if (mode == RTCAudioEngineMuteModeUnknown) {
+        result([FlutterError errorWithCode:[NSString stringWithFormat:@"%@ failed", call.method]
+                                   message:[NSString stringWithFormat:@"Error: invalid mute mode: %@", modeString]
+                                   details:nil]);
+        return;
+      }
+      // With mode restartEngine a mute-state transition rebuilds the audio
+      // engine, so keep this off the platform thread like the recording APIs.
+      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSInteger admResult = [adm setMuteMode:mode];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (admResult == 0) {
+            result(nil);
+          } else {
+            result([FlutterError
+                errorWithCode:[NSString stringWithFormat:@"%@ failed", call.method]
+                      message:[NSString stringWithFormat:@"Error: adm api failed with code: %ld",
+                                                         (long)admResult]
+                      details:nil]);
+          }
+        });
+      });
+    } else if ([@"isMicrophoneMuted" isEqualToString:call.method]) {
+      RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
+      result([NSNumber numberWithBool:adm.isMicrophoneMuted]);
+    } else if ([@"setMicrophoneMuted" isEqualToString:call.method]) {
+      RTCAudioDeviceModule* adm = _peerConnectionFactory.audioDeviceModule;
+      NSNumber* muted = call.arguments[@"muted"];
+      if (![muted isKindOfClass:[NSNumber class]]) {
+        result([FlutterError errorWithCode:[NSString stringWithFormat:@"%@ failed", call.method]
+                                   message:@"Error: muted is required"
+                                   details:nil]);
+        return;
+      }
+      // With mode restartEngine muting rebuilds the audio engine, so keep
+      // this off the platform thread like the recording APIs.
+      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSInteger admResult = [adm setMicrophoneMuted:muted.boolValue];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (admResult == 0) {
+            result(nil);
+          } else {
+            result([FlutterError
+                errorWithCode:[NSString stringWithFormat:@"%@ failed", call.method]
+                      message:[NSString stringWithFormat:@"Error: adm api failed with code: %ld",
+                                                         (long)admResult]
+                      details:nil]);
+          }
+        });
+      });
     } else {
       if([self handleFrameCryptorMethodCall:call result:result]) {
           return;
@@ -1821,12 +1959,18 @@ static FlutterWebRTCPlugin *sharedSingleton;
 
 - (void)ensureAudioSession {
 #if TARGET_OS_IPHONE
+  if (!self.audioSessionManagementEnabled) {
+    return;
+  }
   [AudioUtils ensureAudioSessionWithRecording:[self hasLocalAudioTrack]];
 #endif
 }
 
 - (void)deactiveRtcAudioSession {
 #if TARGET_OS_IPHONE
+  if (!self.audioSessionManagementEnabled) {
+    return;
+  }
   if (![self hasLocalAudioTrack] && self.peerConnections.count == 0) {
     [AudioUtils deactiveRtcAudioSession];
   }
@@ -2021,6 +2165,11 @@ static FlutterWebRTCPlugin *sharedSingleton;
     config.audioJitterBufferMaxPackets = [json[@"audioJitterBufferMaxPackets"] intValue];
   }
 
+  if (json[@"enableSctpSnap"] != nil &&
+      [json[@"enableSctpSnap"] isKindOfClass:[NSNumber class]]) {
+    config.enableSctpSnap = [json[@"enableSctpSnap"] boolValue];
+  }
+
   if (json[@"bundlePolicy"] != nil && [json[@"bundlePolicy"] isKindOfClass:[NSString class]]) {
     NSString* bundlePolicy = json[@"bundlePolicy"];
     if ([bundlePolicy isEqualToString:@"balanced"]) {
@@ -2069,7 +2218,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
   }
 
   if (json[@"enableDscp"] != nil && [json[@"enableDscp"] isKindOfClass:[NSNumber class]]) {
-    config.enableDscp = [json[@"enableDscp"] boolValue];
+    NSNumber* enableDscp = json[@"enableDscp"];
+    config.enableDscp = [enableDscp boolValue];
   }
 
   if (json[@"rtcpMuxPolicy"] != nil && [json[@"rtcpMuxPolicy"] isKindOfClass:[NSString class]]) {
@@ -2187,6 +2337,10 @@ static FlutterWebRTCPlugin *sharedSingleton;
     BOOL sframeRequireFrameEncryption = NO;
     BOOL srtpEnableEncryptedRtpHeaderExtensions = NO;
     BOOL srtpEnableAes128Sha1_32CryptoCipher = NO;
+    // Defaults from webrtc::CryptoOptions::Srtp: GCM is offered last unless
+    // preferred, and AES128_CM_SHA1_80 (the mandatory-to-implement cipher) is on.
+    BOOL srtpPreferGcmCryptoSuites = NO;
+    BOOL srtpEnableAes128Sha1_80CryptoCipher = YES;
 
     if (options[@"enableGcmCryptoSuites"] != nil &&
         [options[@"enableGcmCryptoSuites"] isKindOfClass:[NSNumber class]]) {
@@ -2212,11 +2366,25 @@ static FlutterWebRTCPlugin *sharedSingleton;
       srtpEnableAes128Sha1_32CryptoCipher = [value boolValue];
     }
 
+    if (options[@"preferGcmCryptoSuites"] != nil &&
+        [options[@"preferGcmCryptoSuites"] isKindOfClass:[NSNumber class]]) {
+      NSNumber* value = options[@"preferGcmCryptoSuites"];
+      srtpPreferGcmCryptoSuites = [value boolValue];
+    }
+
+    if (options[@"enableAes128Sha1_80CryptoCipher"] != nil &&
+        [options[@"enableAes128Sha1_80CryptoCipher"] isKindOfClass:[NSNumber class]]) {
+      NSNumber* value = options[@"enableAes128Sha1_80CryptoCipher"];
+      srtpEnableAes128Sha1_80CryptoCipher = [value boolValue];
+    }
+
     config.cryptoOptions = [[RTCCryptoOptions alloc]
              initWithSrtpEnableGcmCryptoSuites:srtpEnableGcmCryptoSuites
+                     srtpPreferGcmCryptoSuites:srtpPreferGcmCryptoSuites
            srtpEnableAes128Sha1_32CryptoCipher:srtpEnableAes128Sha1_32CryptoCipher
+           srtpEnableAes128Sha1_80CryptoCipher:srtpEnableAes128Sha1_80CryptoCipher
         srtpEnableEncryptedRtpHeaderExtensions:srtpEnableEncryptedRtpHeaderExtensions
-                  sframeRequireFrameEncryption:(BOOL)sframeRequireFrameEncryption];
+                  sframeRequireFrameEncryption:sframeRequireFrameEncryption];
   }
 
   return config;
@@ -2297,6 +2465,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
       [obj setObject:encoding.scaleResolutionDownBy forKey:@"scaleResolutionDownBy"];
     if (encoding.ssrc != nil)
       [obj setObject:encoding.ssrc forKey:@"ssrc"];
+    if (encoding.scalabilityMode != nil)
+      [obj setObject:encoding.scalabilityMode forKey:@"scalabilityMode"];
     [obj setObject:[self bitratePriorityToString:encoding.bitratePriority] forKey:@"priority"];
     [obj setObject:[self rtcPriorityToString:encoding.networkPriority] forKey:@"networkPriority"];
 
@@ -2323,8 +2493,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
        degradationPreference = @"maintain-resolution";
     } else if ([parameters.degradationPreference intValue] == RTCDegradationPreferenceBalanced) {
        degradationPreference = @"balanced";
-    } else if ([parameters.degradationPreference intValue] == RTCDegradationPreferenceDisabled) {
-       degradationPreference = @"disabled";
+    } else if ([parameters.degradationPreference intValue] == RTCDegradationPreferenceMaintainFramerateAndResolution) {
+       degradationPreference = @"maintain-framerate-and-resolution";
     }
   }
 
@@ -2596,8 +2766,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
           parameters.degradationPreference = [NSNumber numberWithInt:RTCDegradationPreferenceMaintainResolution];
       } else if ([degradationPreference isEqualToString:@"balanced"]) {
           parameters.degradationPreference = [NSNumber numberWithInt:RTCDegradationPreferenceBalanced];
-      } else if ([degradationPreference isEqualToString:@"disabled"]) {
-          parameters.degradationPreference = [NSNumber numberWithInt:RTCDegradationPreferenceDisabled];
+      } else if ([degradationPreference isEqualToString:@"maintain-framerate-and-resolution"]) {
+          parameters.degradationPreference = [NSNumber numberWithInt:RTCDegradationPreferenceMaintainFramerateAndResolution];
       }
   }
 
@@ -2646,6 +2816,9 @@ static FlutterWebRTCPlugin *sharedSingleton;
       NSNumber* scaleResolutionDownBy = [newParams objectForKey:@"scaleResolutionDownBy"];
       if (scaleResolutionDownBy != nil)
         currentParams.scaleResolutionDownBy = scaleResolutionDownBy;
+      NSString* scalabilityMode = [newParams objectForKey:@"scalabilityMode"];
+      if (scalabilityMode != nil)
+        [currentParams setScalabilityMode:scalabilityMode];
       NSString* priority = [newParams objectForKey:@"priority"];
       if (priority != nil)
         currentParams.bitratePriority = [self stringToBitratePriority:priority];
