@@ -26,17 +26,41 @@ public class FlutterRTCVideoRenderer implements EventChannel.StreamHandler {
     private String mediaStreamId;
 
     private String ownerTag;
+    private boolean isDisposed = false;
 
     public void Dispose() {
-        setVideoTrack(null);
-        if (surfaceTextureRenderer != null) {
-            surfaceTextureRenderer.release();
+        if (isDisposed) {
+            return;
         }
-        if (eventChannel != null)
-            eventChannel.setStreamHandler(null);
+        isDisposed = true;
 
+        try {
+            setVideoTrack(null);
+        } catch (Exception e) {
+            Log.w(TAG, "Error detaching renderer from track during dispose", e);
+        }
+
+        try {
+            if (surfaceTextureRenderer != null) {
+                surfaceTextureRenderer.release();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Error releasing surfaceTextureRenderer", e);
+        }
+
+        if (eventChannel != null) {
+            eventChannel.setStreamHandler(null);
+        }
+        eventChannel = null;
         eventSink = null;
-        producer.release();
+        mediaStreamId = null;
+        ownerTag = null;
+
+        try {
+            producer.release();
+        } catch (Exception e) {
+            Log.w(TAG, "Error releasing surface producer", e);
+        }
     }
 
     /**
