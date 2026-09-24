@@ -143,6 +143,43 @@ static BOOL gAudioSessionManagementEnabled = YES;
 // retains it. See +setAudioDeviceModuleObserver:.
 static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
+// WARP (WebRTC Abridged Roundtrip Protocol, draft-uberti-tsvwg-warp) is opted
+// into through the `enableWARP` initialize() option. The part of it that
+// libwebrtc implements is `WebRTC-IceHandshakeDtls`, the DTLS handshake
+// piggybacked on the ICE STUN binding exchange. The trials end up in the
+// environment the peer connection factory is built with, so the base set is kept
+// in one place and re-applied with the extra trial from -initialize:, which runs
+// before the factory and any peer connection exist.
+static BOOL gWarpEnabled = NO;
+
+// `WebRTC-ForcePlayoutDelay` renders every frame as soon as it is decoded instead
+// of holding it back for the jitter buffer target delay. Opted into through the
+// `zeroPlayoutDelay` initialize() option, and read at the same moment as the
+// trials above.
+static NSString* const kFlutterWebRTCFieldTrialForcePlayoutDelay = @"WebRTC-ForcePlayoutDelay";
+static NSString* const kFlutterWebRTCFieldTrialZeroPlayoutDelayValue = @"min_ms:0,max_ms:0";
+
+static BOOL gZeroPlayoutDelayEnabled = NO;
+
+static void FlutterWebRTCApplyFieldTrials(void) {
+  // "Key/Value/" pairs. +configureFieldTrials: replaces the whole string and is
+  // read when the factory creates its environment, so every trial has to be in
+  // here, and this has to run before the factory is created.
+  NSMutableString* fieldTrials = [NSMutableString
+      stringWithFormat:@"%@/%@/", kRTCFieldTrialUseNWPathMonitor, kRTCFieldTrialEnabledValue];
+  if (gWarpEnabled) {
+    [fieldTrials
+        appendFormat:@"%@/%@/", kRTCFieldTrialIceHandshakeDtlsKey, kRTCFieldTrialEnabledValue];
+  }
+  if (gZeroPlayoutDelayEnabled) {
+    [fieldTrials appendFormat:@"%@/%@/", kFlutterWebRTCFieldTrialForcePlayoutDelay,
+                              kFlutterWebRTCFieldTrialZeroPlayoutDelayValue];
+  }
+  // Replaces the deprecated RTCInitFieldTrialDictionary(), which set a
+  // process-global instead (bugs.webrtc.org/42220378).
+  [RTCPeerConnectionFactory configureFieldTrials:fieldTrials];
+}
+
 + (FlutterWebRTCPlugin *)sharedSingleton
 {
   @synchronized(self)
@@ -245,11 +282,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 #endif
   }
 
-  NSDictionary* fieldTrials = @{kRTCFieldTrialUseNWPathMonitor : kRTCFieldTrialEnabledValue};
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  RTCInitFieldTrialDictionary(fieldTrials);
-#pragma clang diagnostic pop
+  FlutterWebRTCApplyFieldTrials();
 
   self.peerConnections = [NSMutableDictionary new];
   self.localStreams = [NSMutableDictionary new];
@@ -356,11 +389,21 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
 - (void)initialize:(NSArray*)networkIgnoreMask
     bypassVoiceProcessing:(BOOL)bypassVoiceProcessing
-                 severity:(RTCLoggingSeverity)severity {
+                 severity:(RTCLoggingSeverity)severity
+              enableWARP:(BOOL)enableWARP
+        zeroPlayoutDelay:(BOOL)zeroPlayoutDelay {
     // RTCSetMinDebugLogLevel(severity);
     [self initLoggerCallback:severity];
 
     if (!_peerConnectionFactory) {
+        // Field trials have to be in place before the factory builds its transports,
+        // so a later initialize: call cannot change them any more.
+        if (enableWARP != gWarpEnabled || zeroPlayoutDelay != gZeroPlayoutDelayEnabled) {
+          gWarpEnabled = enableWARP;
+          gZeroPlayoutDelayEnabled = zeroPlayoutDelay;
+          FlutterWebRTCApplyFieldTrials();
+        }
+
         VideoDecoderFactory* decoderFactory = [[VideoDecoderFactory alloc] init];
         VideoEncoderFactory* encoderFactory = [[VideoEncoderFactory alloc] init];
 
@@ -461,8 +504,26 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       severity = [self str2LogSeverity:severityStr];
     }
 
+    // WARP (draft-uberti-tsvwg-warp): shortens the connection setup by running the
+    // DTLS handshake inside the ICE STUN binding exchange. Has to be known here,
+    // the field trial is read before any peer connection is built.
+    BOOL enableWARP = NO;
+    if (options[@"enableWARP"] != nil && [options[@"enableWARP"] isKindOfClass:[NSNumber class]]) {
+      enableWARP = ((NSNumber*)options[@"enableWARP"]).boolValue;
+    }
+
+    // Render frames as soon as they are decoded, trading jitter buffer smoothing
+    // for latency. Same timing constraint as WARP: it is a field trial.
+    BOOL zeroPlayoutDelay = NO;
+    if (options[@"zeroPlayoutDelay"] != nil &&
+        [options[@"zeroPlayoutDelay"] isKindOfClass:[NSNumber class]]) {
+      zeroPlayoutDelay = ((NSNumber*)options[@"zeroPlayoutDelay"]).boolValue;
+    }
+
     [self initialize:networkIgnoreMask bypassVoiceProcessing:enableBypassVoiceProcessing
-                     severity:severity];
+                     severity:severity
+                     enableWARP:enableWARP
+                     zeroPlayoutDelay:zeroPlayoutDelay];
     result(@"");
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
@@ -996,24 +1057,39 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
              [@"peerConnectionDispose" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+    BOOL isDispose = [@"peerConnectionDispose" isEqualToString:call.method];
 
     RTCPeerConnection* peerConnection = self.peerConnections[peerConnectionId];
     if (peerConnection) {
+      // Closing twice is harmless, the native peer connection ignores the second call.
       [peerConnection close];
-      [self.peerConnections removeObjectForKey:peerConnectionId];
+      peerConnection.closedByPlugin = YES;
 
       // Clean up peerConnection's streams and tracks
       [peerConnection.remoteStreams removeAllObjects];
       [peerConnection.remoteTracks removeAllObjects];
 
-      // Clean up peerConnection's dataChannels.
+      // Stop delivering data channel events. There is no need to close the
+      // RTCDataChannel because it is owned by the RTCPeerConnection and the
+      // latter will close the former.
       NSMutableDictionary<NSString*, RTCDataChannel*>* dataChannels = peerConnection.dataChannels;
       for (NSString* dataChannelId in dataChannels) {
         dataChannels[dataChannelId].delegate = nil;
-        // There is no need to close the RTCDataChannel because it is owned by the
-        // RTCPeerConnection and the latter will close the former.
       }
-      [dataChannels removeAllObjects];
+
+      if (isDispose) {
+        // Dart cancels its event subscriptions before it calls dispose, so this
+        // is the first point where the stream handlers can go without leaving a
+        // pending cancel unanswered. Releasing them on close would do exactly that.
+        for (NSString* dataChannelId in dataChannels) {
+          [dataChannels[dataChannelId].eventChannel setStreamHandler:nil];
+          dataChannels[dataChannelId].eventChannel = nil;
+        }
+        [dataChannels removeAllObjects];
+        [peerConnection.eventChannel setStreamHandler:nil];
+        peerConnection.eventChannel = nil;
+        [self.peerConnections removeObjectForKey:peerConnectionId];
+      }
     }
     [self deactiveRtcAudioSession];
     result(nil);
@@ -1109,7 +1185,7 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
       NSNumber* viewId = argsMap[@"viewId"];
       FlutterRTCVideoPlatformViewController* render = _platformViewFactory.renders[viewId];
       if(render != nil) {
-        render.videoTrack = nil;
+        [render dispose];
         [_platformViewFactory.renders removeObjectForKey:viewId];
       }
       result(nil);
@@ -1966,12 +2042,24 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 #endif
 }
 
+- (BOOL)hasOpenPeerConnection {
+  // Closed connections stay registered until dispose but must not keep the
+  // audio session alive. The flag avoids a blocking signalingState read per
+  // connection on the platform thread.
+  for (RTCPeerConnection* peerConnection in self.peerConnections.allValues) {
+    if (!peerConnection.closedByPlugin) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
 - (void)deactiveRtcAudioSession {
 #if TARGET_OS_IPHONE
   if (!self.audioSessionManagementEnabled) {
     return;
   }
-  if (![self hasLocalAudioTrack] && self.peerConnections.count == 0) {
+  if (![self hasLocalAudioTrack] && ![self hasOpenPeerConnection]) {
     [AudioUtils deactiveRtcAudioSession];
   }
 #endif
@@ -2150,6 +2238,13 @@ static __weak id<RTCAudioDeviceModuleDelegate> gAudioDeviceModuleObserver = nil;
 
 - (nonnull RTCConfiguration*)RTCConfiguration:(id)json {
   RTCConfiguration* config = [[RTCConfiguration alloc] init];
+
+  // WARP also marks the packets with DSCP; the field trial that carries the DTLS
+  // handshake in the STUN exchange was applied in -initialize:. An explicit
+  // `enableDscp` in the configuration below still wins.
+  if (gWarpEnabled) {
+    config.enableDscp = YES;
+  }
 
   if (!json) {
     return config;

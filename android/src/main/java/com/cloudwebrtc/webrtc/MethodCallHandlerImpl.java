@@ -147,6 +147,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   public AudioProcessingController audioProcessingController;
 
+  // WARP (WebRTC Abridged Roundtrip Protocol, draft-uberti-tsvwg-warp) is opted
+  // into through the `enableWARP` initialize() option. The part of it that
+  // libwebrtc implements is `WebRTC-IceHandshakeDtls`, the DTLS handshake
+  // piggybacked on the ICE STUN binding exchange. Field trials are process-global
+  // and are read when a peer connection builds its transports, so they are passed
+  // to PeerConnectionFactory.initialize() before any peer connection exists.
+  private static final String FIELD_TRIAL_ICE_HANDSHAKE_DTLS =
+          "WebRTC-IceHandshakeDtls/Enabled/";
+
+  // `WebRTC-ForcePlayoutDelay` renders every frame as soon as it is decoded instead
+  // of holding it back for the jitter buffer target delay. Opted into through the
+  // `zeroPlayoutDelay` initialize() option, and read at the same moment as the
+  // trial above.
+  private static final String FIELD_TRIAL_FORCE_PLAYOUT_DELAY =
+          "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
+
+  private static boolean warpEnabled = false;
+
   public static class LogSink implements Loggable {
     @Override
     public void onLogMessage(String message, Severity sev, String tag) {
@@ -224,18 +242,31 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     renders.clear();
   }
   private void initialize(boolean bypassVoiceProcessing, boolean androidUseHardwareAudioProcessing, int networkIgnoreMask, boolean forceSWCodec, List<String> forceSWCodecList,
-  @Nullable ConstraintsMap androidAudioConfiguration, Severity logSeverity, @Nullable Integer audioSampleRate, @Nullable Integer audioOutputSampleRate) {
+  @Nullable ConstraintsMap androidAudioConfiguration, Severity logSeverity, @Nullable Integer audioSampleRate, @Nullable Integer audioOutputSampleRate, boolean enableWARP, boolean zeroPlayoutDelay) {
     if (mFactory != null) {
       return;
     }
 
+    warpEnabled = enableWARP;
 
-    PeerConnectionFactory.initialize(
+    InitializationOptions.Builder initializationOptionsBuilder =
             InitializationOptions.builder(context)
-                    .setFieldTrials("IncludeWifiDirect/Enabled/")
                     .setEnableInternalTracer(true)
-                    .setInjectableLogger(logSink, logSeverity)
-                    .createInitializationOptions());
+                    .setInjectableLogger(logSink, logSeverity);
+
+    String fieldTrials = "IncludeWifiDirect/Enabled/";
+    if (enableWARP) {
+      fieldTrials += FIELD_TRIAL_ICE_HANDSHAKE_DTLS;
+    }
+    if (zeroPlayoutDelay) {
+      fieldTrials += FIELD_TRIAL_FORCE_PLAYOUT_DELAY;
+    }
+    if (!fieldTrials.isEmpty()) {
+      initializationOptionsBuilder.setFieldTrials(fieldTrials);
+      Log.d(TAG, "enabled field trials: " + fieldTrials);
+    }
+
+    PeerConnectionFactory.initialize(initializationOptionsBuilder.createInitializationOptions());
 
     NetworkMonitorAutoDetect.setIncludeWifiDirect(true);
     getUserMediaImpl = new GetUserMediaImpl(this, context);
@@ -475,7 +506,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
           audioOutputSampleRate = constraintsMap.getInt("audioOutputSampleRate");
         }
 
-        initialize(enableBypassVoiceProcessing, androidUseHardwareAudioProcessing, networkIgnoreMask, forceSWCodec, forceSWCodecList, androidAudioConfiguration, logSeverity, audioSampleRate, audioOutputSampleRate);
+        // WARP (draft-uberti-tsvwg-warp): shortens the connection setup by running
+        // the DTLS handshake inside the ICE STUN binding exchange. Has to be known
+        // here, the field trial is read before any peer connection is built.
+        boolean enableWARP = false;
+        if (constraintsMap.hasKey("enableWARP")
+                && constraintsMap.getType("enableWARP") == ObjectType.Boolean) {
+          enableWARP = constraintsMap.getBoolean("enableWARP");
+        }
+
+        // Render frames as soon as they are decoded, trading jitter buffer smoothing
+        // for latency. Same timing constraint as WARP: it is a field trial.
+        boolean zeroPlayoutDelay = false;
+        if (constraintsMap.hasKey("zeroPlayoutDelay")
+                && constraintsMap.getType("zeroPlayoutDelay") == ObjectType.Boolean) {
+          zeroPlayoutDelay = constraintsMap.getBoolean("zeroPlayoutDelay");
+        }
+
+        initialize(enableBypassVoiceProcessing, androidUseHardwareAudioProcessing, networkIgnoreMask, forceSWCodec, forceSWCodecList, androidAudioConfiguration, logSeverity, audioSampleRate, audioOutputSampleRate, enableWARP, zeroPlayoutDelay);
         result.success(null);
         break;
       }
@@ -1314,6 +1362,14 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
     List<IceServer> iceServers = createIceServers(iceServersArray);
     RTCConfiguration conf = new RTCConfiguration(iceServers);
+
+    // WARP also marks the packets with DSCP; the field trial that carries the DTLS
+    // handshake in the STUN exchange was applied at initialize() time. An explicit
+    // `enableDscp` in the configuration below still wins.
+    if (warpEnabled) {
+      conf.enableDscp = true;
+    }
+
     if (map == null) {
       return conf;
     }
