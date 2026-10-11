@@ -238,19 +238,6 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
     }
     mPeerConnectionObservers.clear();
-
-    for (int i = 0; i < renders.size(); i++) {
-      FlutterRTCVideoRenderer renderer = renders.valueAt(i);
-      if (renderer == null) {
-        continue;
-      }
-      try {
-        renderer.Dispose();
-      } catch (Exception e) {
-        Log.w(TAG, "Error disposing renderer during cleanup", e);
-      }
-    }
-    renders.clear();
   }
   private void initialize(boolean bypassVoiceProcessing, boolean androidUseHardwareAudioProcessing, int networkIgnoreMask, boolean forceSWCodec, List<String> forceSWCodecList,
   @Nullable ConstraintsMap androidAudioConfiguration, Severity logSeverity, @Nullable Integer audioSampleRate, @Nullable Integer audioOutputSampleRate, boolean enableWARP, boolean zeroPlayoutDelay) {
